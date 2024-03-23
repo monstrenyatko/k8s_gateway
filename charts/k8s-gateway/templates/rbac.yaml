@@ -5,6 +5,9 @@ metadata:
   name: {{ include "k8s-gateway.fullname" . }}
   labels:
     {{- include "k8s-gateway.labels" . | nindent 4 }}
+    {{- if .Values.customLabels }}
+    {{ toYaml .Values.customLabels | trim | nindent 4 }}
+    {{- end }}
 rules:
 - apiGroups:
   - ""
@@ -22,13 +25,22 @@ rules:
   verbs:
   - list
   - watch
+- apiGroups: ["gateway.networking.k8s.io"]
+  resources: ["*"]
+  verbs: ["watch", "list"]
+- apiGroups: ["k8s.nginx.org"]
+  resources: ["*"]
+  verbs: ["watch", "list"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
   name: {{ include "k8s-gateway.fullname" . }}
   labels:
-  {{- include "k8s-gateway.labels" . | nindent 4 }}
+    {{- include "k8s-gateway.labels" . | nindent 4 }}
+    {{- if .Values.customLabels }}
+    {{ toYaml .Values.customLabels | trim | nindent 4 }}
+    {{- end }}
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole

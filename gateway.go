@@ -4,37 +4,57 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"os"
+	"net/netip"
 	"strings"
 
 	"github.com/coredns/coredns/plugin"
+	"github.com/coredns/coredns/plugin/pkg/fall"
 	"github.com/coredns/coredns/request"
 	"github.com/miekg/dns"
 )
 
-const defaultSvc = "external-dns.kube-system"
-
-type lookupFunc func(indexKeys []string) []net.IP
+type lookupFunc func(indexKeys []string) []netip.Addr
 
 type resourceWithIndex struct {
 	name   string
 	lookup lookupFunc
 }
 
+var noop lookupFunc = func([]string) (result []netip.Addr) { return }
+
 var orderedResources = []*resourceWithIndex{
 	{
-		name: "Ingress",
+		name:   "HTTPRoute",
+		lookup: noop,
 	},
 	{
-		name: "Service",
+		name:   "TLSRoute",
+		lookup: noop,
+	},
+	{
+		name:   "GRPCRoute",
+		lookup: noop,
+	},
+	{
+		name:   "VirtualServer",
+		lookup: noop,
+	},
+	{
+		name:   "Ingress",
+		lookup: noop,
+	},
+	{
+		name:   "Service",
+		lookup: noop,
 	},
 }
 
 var (
-	ttlLowDefault     = uint32(60)
-	ttlHighDefault    = uint32(3600)
-	defaultApex       = "dns"
+	ttlDefault        = uint32(60)
+	ttlSOA            = uint32(60)
+	defaultApex       = "dns1.kube-system"
 	defaultHostmaster = "hostmaster"
+	defaultSecondNS   = ""
 )
 
 // Gateway stores all runtime configuration of a plugin
@@ -43,19 +63,25 @@ type Gateway struct {
 	Zones            []string
 	Resources        []*resourceWithIndex
 	ttlLow           uint32
-	ttlHigh          uint32
+	ttlSOA           uint32
 	Controller       *KubeController
 	apex             string
 	hostmaster       string
+	secondNS         string
+	configFile       string
+	configContext    string
 	ExternalAddrFunc func(request.Request) []dns.RR
+
+	Fall fall.F
 }
 
 func newGateway() *Gateway {
 	return &Gateway{
 		Resources:  orderedResources,
-		ttlLow:     ttlLowDefault,
-		ttlHigh:    ttlHighDefault,
+		ttlLow:     ttlDefault,
+		ttlSOA:     ttlSOA,
 		apex:       defaultApex,
+		secondNS:   defaultSecondNS,
 		hostmaster: defaultHostmaster,
 	}
 }
@@ -113,10 +139,11 @@ func (gw *Gateway) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 		return dns.RcodeServerFailure, plugin.Error(thisPlugin, fmt.Errorf("Could not sync required resources"))
 	}
 
+	var isRootZoneQuery bool
 	for _, z := range gw.Zones {
 		if state.Name() == z { // apex query
-			ret, err := gw.serveApex(state)
-			return ret, err
+			isRootZoneQuery = true
+			break
 		}
 		if dns.IsSubDomain(gw.apex+"."+z, state.Name()) {
 			// dns subdomain test for ns. and dns. queries
@@ -125,7 +152,7 @@ func (gw *Gateway) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 		}
 	}
 
-	var addrs []net.IP
+	var addrs []netip.Addr
 
 	// Iterate over supported resources and lookup DNS queries
 	// Stop once we've found at least one match
@@ -137,28 +164,88 @@ func (gw *Gateway) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 	}
 	log.Debugf("Computed response addresses %v", addrs)
 
+	// Fall through if no host matches
+	if len(addrs) == 0 && gw.Fall.Through(qname) {
+		return plugin.NextOrFailure(gw.Name(), gw.Next, ctx, w, r)
+	}
+
 	m := new(dns.Msg)
 	m.SetReply(state.Req)
 
-	if len(addrs) == 0 {
-		m.Rcode = dns.RcodeNameError
-		m.Ns = []dns.RR{gw.soa(state)}
-		if err := w.WriteMsg(m); err != nil {
-			log.Errorf("Failed to send a response: %s", err)
+	var ipv4Addrs []netip.Addr
+	var ipv6Addrs []netip.Addr
+
+	for _, addr := range addrs {
+		if addr.Is4() {
+			ipv4Addrs = append(ipv4Addrs, addr)
 		}
-		return 0, nil
+		if addr.Is6() {
+			ipv6Addrs = append(ipv6Addrs, addr)
+		}
 	}
 
 	switch state.QType() {
 	case dns.TypeA:
-		m.Answer = gw.A(state, addrs)
+
+		if len(ipv4Addrs) == 0 {
+
+			if !isRootZoneQuery {
+				// No match, return NXDOMAIN
+				m.Rcode = dns.RcodeNameError
+			}
+
+			m.Ns = []dns.RR{gw.soa(state)}
+
+		} else {
+
+			m.Answer = gw.A(state.Name(), ipv4Addrs)
+		}
+	case dns.TypeAAAA:
+
+		if len(ipv6Addrs) == 0 {
+
+			if !isRootZoneQuery {
+				// No match, return NXDOMAIN
+				m.Rcode = dns.RcodeNameError
+			}
+
+			// as per rfc4074 #3
+			if len(ipv4Addrs) > 0 {
+				m.Rcode = dns.RcodeSuccess
+			}
+
+			m.Ns = []dns.RR{gw.soa(state)}
+
+		} else {
+
+			m.Answer = gw.AAAA(state.Name(), ipv6Addrs)
+		}
+
+	case dns.TypeSOA:
+
+		m.Answer = []dns.RR{gw.soa(state)}
+
+	case dns.TypeNS:
+
+		if isRootZoneQuery {
+			m.Answer = gw.nameservers(state)
+
+			addr := gw.ExternalAddrFunc(state)
+			for _, rr := range addr {
+				rr.Header().Ttl = gw.ttlSOA
+				m.Extra = append(m.Extra, rr)
+			}
+		} else {
+			m.Ns = []dns.RR{gw.soa(state)}
+		}
+
 	default:
 		m.Ns = []dns.RR{gw.soa(state)}
 	}
 
-	if len(m.Answer) == 0 {
-		m.Ns = []dns.RR{gw.soa(state)}
-	}
+	// Force to true to fix broken behaviour of legacy glibc `getaddrinfo`.
+	// See https://github.com/coredns/coredns/pull/3573
+	m.Authoritative = true
 
 	if err := w.WriteMsg(m); err != nil {
 		log.Errorf("Failed to send a response: %s", err)
@@ -171,41 +258,50 @@ func (gw *Gateway) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 func (gw *Gateway) Name() string { return thisPlugin }
 
 // A does the A-record lookup in ingress indexer
-func (gw *Gateway) A(state request.Request, results []net.IP) (records []dns.RR) {
+func (gw *Gateway) A(name string, results []netip.Addr) (records []dns.RR) {
 	dup := make(map[string]struct{})
 	for _, result := range results {
 		if _, ok := dup[result.String()]; !ok {
 			dup[result.String()] = struct{}{}
-			records = append(records, &dns.A{Hdr: dns.RR_Header{Name: state.Name(), Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: gw.ttlLow}, A: result})
+			records = append(records, &dns.A{Hdr: dns.RR_Header{Name: name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: gw.ttlLow}, A: net.ParseIP(result.String())})
 		}
 	}
 	return records
 }
 
-func (gw *Gateway) SelfAddress(state request.Request) (records []dns.RR) {
-	// TODO: need to do self-index lookup for that i need
-	// a) my own namespace - easy
-	// b) my own serviceName - CoreDNS/k does that via localIP->Endpoint->Service
-	// I don't really want to list Endpoints just for that so will fix that later
-
-	// As a workaround I'm reading an env variable (with a default)
-	//// TODO: update docs to surface this knob
-	index := os.Getenv("EXTERNAL_SVC")
-	if index == "" {
-		index = defaultSvc
+func (gw *Gateway) AAAA(name string, results []netip.Addr) (records []dns.RR) {
+	dup := make(map[string]struct{})
+	for _, result := range results {
+		if _, ok := dup[result.String()]; !ok {
+			dup[result.String()] = struct{}{}
+			records = append(records, &dns.AAAA{Hdr: dns.RR_Header{Name: name, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: gw.ttlLow}, AAAA: net.ParseIP(result.String())})
+		}
 	}
+	return records
+}
 
-	var addrs []net.IP
+// SelfAddress returns the address of the local k8s_gateway service
+func (gw *Gateway) SelfAddress(state request.Request) (records []dns.RR) {
+
+	var addrs1, addrs2 []netip.Addr
 	for _, resource := range gw.Resources {
-		addrs = resource.lookup([]string{index})
-		if len(addrs) > 0 {
-			break
+		results := resource.lookup([]string{gw.apex})
+		if len(results) > 0 {
+			addrs1 = append(addrs1, results...)
+		}
+		results = resource.lookup([]string{gw.secondNS})
+		if len(results) > 0 {
+			addrs2 = append(addrs2, results...)
 		}
 	}
 
-	m := new(dns.Msg)
-	m.SetReply(state.Req)
-	return gw.A(state, addrs)
+	records = append(records, gw.A(gw.apex+"."+state.Zone, addrs1)...)
+
+	if state.QType() == dns.TypeNS {
+		records = append(records, gw.A(gw.secondNS+"."+state.Zone, addrs2)...)
+	}
+
+	return records
 	//return records
 }
 

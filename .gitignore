@@ -1,4 +1,8 @@
+vendor
 coredns
 tilt_modules
+*.tmp
 .helm
 .vscode
+.idea
+.history
