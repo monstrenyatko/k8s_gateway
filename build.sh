@@ -15,4 +15,7 @@ echo PARAMS: "${build_params}"
 # Exit on error
 set -e
 
-docker buildx build --progress plain --platform linux/arm/v6,linux/arm64,linux/386,linux/amd64 --tag ${build_tag} ${build_params} .
+COMMIT=$(git describe --dirty --always)
+LDFLAGS="-s -w -X github.com/coredns/coredns/coremain.GitCommit=${COMMIT}"
+
+docker buildx build --progress plain --platform linux/arm64,linux/amd64 --tag ${build_tag} --build-arg LDFLAGS="${LDFLAGS}" ${build_params} .
